@@ -4,6 +4,18 @@ use pdfcraft_cos::{Document, Object, SaveOptions, write_full, write_incremental}
 
 use super::*;
 
+#[test]
+fn page_rotation_resolves_inheritance_overrides_and_missing_pages() {
+    let mut doc = Document::open(Arc::new(fixture())).unwrap();
+    for page in 0..3 {
+        assert_eq!(page_rotation(&doc, page).unwrap(), 90);
+    }
+    rotate_pages(&mut doc, &[1], -180).unwrap();
+    assert_eq!(page_rotation(&doc, 1).unwrap(), 270);
+    assert_eq!(page_rotation(&doc, 0).unwrap(), 90);
+    assert_eq!(page_rotation(&doc, 3), Err(OrganizeError::NoSuchPage(3)));
+}
+
 /// A 3-page document with a nested page tree. MediaBox and Rotate are inherited from the root,
 /// Resources from an intermediate node; each page's content says which page it is.
 fn fixture() -> Vec<u8> {
@@ -898,7 +910,7 @@ fn page_label_limits_validate_the_same_ranges_that_are_written() {
 }
 
 #[test]
-fn page_label_limits_reject_ambiguous_old_ranges_before_editing() {
+fn page_label_duplicate_starts_keep_the_later_range() {
     let mut d = doc_a();
     let mut a = Dict::new();
     a.set(b"P".to_vec(), Object::String(PdfString::text("first")));
@@ -908,10 +920,47 @@ fn page_label_limits_reject_ambiguous_old_ranges_before_editing() {
     tree.set(b"Nums".to_vec(), Object::Array(vec![Object::Int(0), Object::Dict(a), Object::Int(0), Object::Dict(b)]));
     let tree = d.add(Object::Dict(tree));
     d.update_dict(d.root().unwrap(), |c| c.set(b"PageLabels".to_vec(), Object::Ref(tree))).unwrap();
-    let before = d.modified_objects();
-    assert!(crate::page_labels(&d).unwrap_err().to_string().contains("unique"));
-    assert!(crate::number_pages(&mut d, 0, 0, crate::LabelStyle::Decimal, "", 1).is_err());
-    assert_eq!(d.modified_objects(), before);
+    assert_eq!(crate::page_labels(&d).unwrap()[0], "last");
+    crate::number_pages(&mut d, 0, 0, crate::LabelStyle::Decimal, "", 1).unwrap();
+}
+
+/// Two kids naming objects the file doesn't have both resolve to a fresh `Null`; they are not
+/// the same node, so the tree isn't refused as cyclic.
+#[test]
+fn page_label_missing_kids_are_not_a_cycle() {
+    let mut d = doc_a();
+    let mut leaf = Dict::new();
+    let mut spec = Dict::new();
+    spec.set(b"P".to_vec(), Object::String(PdfString::text("p-")));
+    spec.set(b"S".to_vec(), Object::name("D"));
+    leaf.set(b"Nums".to_vec(), Object::Array(vec![Object::Int(0), Object::Dict(spec)]));
+    let leaf = d.add(Object::Dict(leaf));
+    let mut tree = Dict::new();
+    let missing = |n| Object::Ref(pdfcraft_cos::ObjRef { num: n, generation: 0 });
+    tree.set(b"Kids".to_vec(), Object::Array(vec![missing(9_000), missing(9_001), Object::Ref(leaf)]));
+    let tree = d.add(Object::Dict(tree));
+    d.update_dict(d.root().unwrap(), |c| c.set(b"PageLabels".to_vec(), Object::Ref(tree))).unwrap();
+    assert_eq!(crate::page_labels(&d).unwrap()[0], "p-1");
+}
+
+/// A range whose labels would be too long shows physical page numbers; other ranges keep
+/// their labels.
+#[test]
+fn page_label_too_long_range_falls_back_alone() {
+    let mut d = doc_a();
+    let mut ok = Dict::new();
+    ok.set(b"P".to_vec(), Object::String(PdfString::text("ok-")));
+    ok.set(b"S".to_vec(), Object::name("D"));
+    let mut huge = Dict::new();
+    huge.set(b"S".to_vec(), Object::name("r"));
+    huge.set(b"St".to_vec(), Object::Int(1_025_000));
+    let mut tree = Dict::new();
+    tree.set(b"Nums".to_vec(), Object::Array(vec![Object::Int(0), Object::Dict(ok), Object::Int(1), Object::Dict(huge)]));
+    let tree = d.add(Object::Dict(tree));
+    d.update_dict(d.root().unwrap(), |c| c.set(b"PageLabels".to_vec(), Object::Ref(tree))).unwrap();
+    let labels = crate::page_labels(&d).unwrap();
+    assert_eq!(labels[0], "ok-1");
+    assert_eq!(labels[1], "2");
 }
 
 #[test]

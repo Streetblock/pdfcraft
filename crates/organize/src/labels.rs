@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 
 use pdfcraft_cos::page_labels::{MAX_LABEL_BYTES, MAX_LABEL_TOTAL_BYTES, MAX_LABEL_TREE_DEPTH, MAX_LABEL_TREE_WORK, MAX_PREFIX_BYTES, alpha, roman};
-use pdfcraft_cos::{Dict, Document, Object, PdfString};
+use pdfcraft_cos::{Dict, Document, ObjRef, Object, PdfString};
 
 use crate::{OrganizeError, page_count, pages_root};
 
@@ -135,7 +135,7 @@ fn with_label_object<T>(doc: &Document, object: &Object, f: impl FnOnce(&Object)
 }
 
 fn label_work(left: &mut usize, count: usize) -> Result<(), OrganizeError> {
-    *left = left.checked_sub(count).ok_or_else(|| invalid_label("the number tree exceeds 10000 work entries"))?;
+    *left = left.checked_sub(count).ok_or_else(|| invalid_label("the number tree has too many entries"))?;
     Ok(())
 }
 
@@ -144,17 +144,21 @@ fn read_label_node(
     node: &Object,
     depth: usize,
     left: &mut usize,
-    seen: &mut HashSet<*const Object>,
+    seen: &mut HashSet<ObjRef>,
     entries: &mut Vec<LabelRange>,
 ) -> Result<(), OrganizeError> {
     label_work(left, 1)?;
     if depth > MAX_LABEL_TREE_DEPTH {
         return Err(invalid_label("the number tree is too deep"));
     }
+    // Only indirect nodes can be reached twice; key them by reference, not by the address of
+    // a resolved object (a missing reference resolves to a fresh, short-lived `Null`).
+    if let Object::Ref(r) = node
+        && !seen.insert(*r)
+    {
+        return Err(invalid_label("the number tree repeats a node or contains a cycle"));
+    }
     with_label_object(doc, node, |node| {
-        if !seen.insert(node as *const Object) {
-            return Err(invalid_label("the number tree repeats a node or contains a cycle"));
-        }
         let Some(d) = node.as_dict() else { return Ok(()) };
         if let Some(nums) = d.get(b"Nums") {
             with_label_object(doc, nums, |nums| {
@@ -215,14 +219,22 @@ fn checked_ranges(doc: &Document) -> Result<Vec<LabelRange>, OrganizeError> {
     let mut entries = Vec::new();
     let mut left = MAX_LABEL_TREE_WORK;
     read_label_node(doc, tree, 0, &mut left, &mut HashSet::new(), &mut entries)?;
+    // A start page given twice keeps its later range, as readers that overwrite do (the sort is
+    // stable, so the later one is last among equals).
     entries.sort_by_key(|r| r.start);
-    if entries.windows(2).any(|pair| pair.first().zip(pair.get(1)).is_some_and(|(a, b)| a.start == b.start)) {
-        return Err(invalid_label("range start pages must be unique"));
+    let mut unique: Vec<LabelRange> = Vec::with_capacity(entries.len());
+    for r in entries {
+        match unique.last_mut() {
+            Some(last) if last.start == r.start => *last = r,
+            _ => unique.push(r),
+        }
     }
-    Ok(entries)
+    Ok(unique)
 }
 
-fn labels_from_ranges(n: usize, ranges: &[LabelRange]) -> Result<Vec<String>, OrganizeError> {
+/// Every page's label. `lenient` (reading a file): a range whose label can't be formatted
+/// shows physical page numbers for its pages instead of failing every label.
+fn labels_from_ranges(n: usize, ranges: &[LabelRange], lenient: bool) -> Result<Vec<String>, OrganizeError> {
     let mut labels = Vec::new();
     let mut total = 0usize;
     let mut ranges = ranges.iter().peekable();
@@ -233,7 +245,11 @@ fn labels_from_ranges(n: usize, ranges: &[LabelRange]) -> Result<Vec<String>, Or
         }
         let label = match active {
             Some(r) => {
-                let label = r.label(p)?;
+                let label = match r.label(p) {
+                    Ok(label) => label,
+                    Err(_) if lenient => String::new(),
+                    Err(e) => return Err(e),
+                };
                 total = total.checked_add(label.len()).ok_or_else(|| invalid_label("the total label size overflows"))?;
                 if total > MAX_LABEL_TOTAL_BYTES {
                     return Err(invalid_label("custom labels exceed 4 MiB in total"));
@@ -249,7 +265,7 @@ fn labels_from_ranges(n: usize, ranges: &[LabelRange]) -> Result<Vec<String>, Or
 
 /// Every page's label, as a viewer shows it. Resource limits return an actionable error.
 pub fn page_labels(doc: &Document) -> Result<Vec<String>, OrganizeError> {
-    labels_from_ranges(page_count(doc)?, &checked_ranges(doc)?)
+    labels_from_ranges(page_count(doc)?, &checked_ranges(doc)?, true)
 }
 
 /// Replace all label ranges (an empty list removes `/PageLabels`).
@@ -263,7 +279,7 @@ pub fn set_page_label_ranges(doc: &mut Document, ranges: &[LabelRange]) -> Resul
         return Ok(());
     }
     if ranges.len() >= MAX_LABEL_TREE_WORK {
-        return Err(invalid_label("the number tree exceeds 10000 work entries"));
+        return Err(invalid_label("the number tree has too many entries"));
     }
     // Validate every range and all effective labels before changing any document object.
     for r in ranges {
@@ -277,7 +293,7 @@ pub fn set_page_label_ranges(doc: &mut Document, ranges: &[LabelRange]) -> Resul
     if sorted.windows(2).any(|pair| pair.first().zip(pair.get(1)).is_some_and(|(a, b)| a.start == b.start)) {
         return Err(invalid_label("range start pages must be unique"));
     }
-    labels_from_ranges(page_count(doc)?, &sorted)?;
+    labels_from_ranges(page_count(doc)?, &sorted, false)?;
     let mut nums = Vec::new();
     for r in &sorted {
         let mut spec = Dict::new();
@@ -354,8 +370,8 @@ mod tests {
     fn page_label_limits_bound_organizer_total_output() {
         let range = LabelRange { start: 0, style: LabelStyle::None, prefix: "x".repeat(MAX_LABEL_BYTES), first: u32::MAX };
         let count = MAX_LABEL_TOTAL_BYTES / MAX_LABEL_BYTES;
-        assert_eq!(labels_from_ranges(count, std::slice::from_ref(&range)).unwrap().len(), count);
-        assert!(labels_from_ranges(count + 1, &[range]).unwrap_err().to_string().contains("4 MiB"));
+        assert_eq!(labels_from_ranges(count, std::slice::from_ref(&range), false).unwrap().len(), count);
+        assert!(labels_from_ranges(count + 1, &[range], false).unwrap_err().to_string().contains("4 MiB"));
     }
 
     #[test]
