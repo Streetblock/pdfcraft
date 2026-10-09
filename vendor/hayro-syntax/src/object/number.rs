@@ -125,11 +125,14 @@ fn read_inner(r: &mut Reader<'_>) -> Option<Number> {
         _ => false,
     };
 
-    // PdfCraft patch / PrintCraft patch: high-precision float mantissa overflow (jsPDF double-precision coordinates).
+    // PdfCraft patch: high-precision float mantissa overflow (jsPDF double-precision coordinates).
+    // Digits that don't fit in `mantissa` are dropped: past the dot they are only precision;
+    // before it, each one scales the value by ten (`extra_int_digits`).
     let mut mantissa: u64 = 0;
     let mut has_dot = false;
     let mut decimal_shift: u32 = 0;
     let mut has_digits = false;
+    let mut extra_int_digits: u32 = 0;
 
     loop {
         match r.peek_byte() {
@@ -142,7 +145,7 @@ fn read_inner(r: &mut Reader<'_>) -> Option<Number> {
                         decimal_shift += 1;
                     }
                 } else if !has_dot {
-                    mantissa = u64::MAX;
+                    extra_int_digits = extra_int_digits.saturating_add(1);
                 }
                 // If has_dot and adding the digit would overflow u64:
                 // Safely ignore excess trailing fractional digits (do not add, do not increment decimal_shift).
@@ -175,6 +178,18 @@ fn read_inner(r: &mut Reader<'_>) -> Option<Number> {
         return None;
     }
 
+    // A value whose integer part overflowed `u64` is a real, scaled by the digits dropped and
+    // kept finite.
+    let scaled = |value: f64| -> f64 {
+        let value = if extra_int_digits > 0 { value * powi_f64(10.0, extra_int_digits) } else { value };
+        if value.is_finite() { value } else { f64::MAX }
+    };
+
+    if !has_dot && extra_int_digits > 0 {
+        let value = scaled(mantissa as f64);
+        return Some(Number(InternalNumber::Real(if negative { -value } else { value })));
+    }
+
     if !has_dot {
         let value = if mantissa <= i64::MAX as u64 {
             let i = mantissa as i64;
@@ -190,7 +205,7 @@ fn read_inner(r: &mut Reader<'_>) -> Option<Number> {
         };
         Some(Number(InternalNumber::Integer(value)))
     } else {
-        let mut value = mantissa as f64;
+        let mut value = scaled(mantissa as f64);
 
         if decimal_shift > 0 {
             if decimal_shift < POWERS_OF_10.len() as u32 {
@@ -563,5 +578,19 @@ mod tests {
             .read_without_context::<f64>()
             .unwrap();
         assert!((num3 - 0.12345678901234568).abs() < 1e-15, "got {num3}");
+
+        // Integer digits past `u64` scale the value instead of being dropped.
+        let num4 = Reader::new("123456789012345678901.5".as_bytes())
+            .read_without_context::<f64>()
+            .unwrap();
+        assert!((num4 / 1.2345678901234568e20 - 1.0).abs() < 1e-12, "got {num4}");
+        let num5 = Reader::new("-123456789012345678901".as_bytes())
+            .read_without_context::<f64>()
+            .unwrap();
+        assert!((num5 / -1.2345678901234568e20 - 1.0).abs() < 1e-12, "got {num5}");
+        // Hundreds of digits stay finite.
+        let huge = "9".repeat(400);
+        let num6 = Reader::new(huge.as_bytes()).read_without_context::<f64>().unwrap();
+        assert!(num6.is_finite() && num6 > 1e300, "got {num6}");
     }
 }
