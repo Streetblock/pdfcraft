@@ -39,6 +39,10 @@ pub(crate) mod flate {
 
                 fallback::decode(data, limit)
             })?;
+        // PdfCraft patch: output cut at the limit is reported, never dropped silently.
+        if decoded.len() >= limit {
+            warn!("flate stream stopped at its decode limit of {limit} bytes");
+        }
         let params = PredictorParams::from_params(params);
         apply_predictor(decoded, &params)
     }
@@ -46,6 +50,10 @@ pub(crate) mod flate {
     #[cfg(not(feature = "unsafe"))]
     pub(crate) fn decode(data: &[u8], params: &Dict<'_>, limit: usize) -> Option<Vec<u8>> {
         let decoded = fallback::decode(data, limit)?;
+        // PdfCraft patch: output cut at the limit is reported, never dropped silently.
+        if decoded.len() >= limit {
+            warn!("flate stream stopped at its decode limit of {limit} bytes");
+        }
         let params = PredictorParams::from_params(params);
         apply_predictor(decoded, &params)
     }
@@ -595,6 +603,10 @@ pub(crate) mod lzw {
         let params = PredictorParams::from_params(params);
 
         let decoded = decode_impl(data, params.early_change, limit)?;
+        // PdfCraft patch: output cut at the limit is reported, never dropped silently.
+        if decoded.len() >= limit {
+            warn!("LZW stream stopped at its decode limit of {limit} bytes");
+        }
 
         apply_predictor(decoded, &params)
     }
