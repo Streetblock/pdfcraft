@@ -1217,6 +1217,15 @@ mod tests {
     }
 
     #[test]
+    fn german_certificate_subject_has_a_distinct_context() {
+        let de = Lang::from_code("de").expect("de registered");
+        assert_eq!(tr(de, "Subject"), "Thema");
+        assert_eq!(tr_ctx(de, "certificate", "Subject"), "Zertifikatsinhaber");
+        assert_eq!(tr_ctx(de, "certificate", "Issuer"), tr(de, "Issuer"));
+        assert_eq!(tr_ctx(Lang::EN, "certificate", "Subject"), "Subject");
+    }
+
+    #[test]
     fn german_history_and_diagnostics_preserve_user_values() {
         let de = Lang::from_code("de").expect("de registered");
         set_current(de);
