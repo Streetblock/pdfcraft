@@ -2104,3 +2104,6 @@ calendar date	December	грудня
 	Squiggly	Хвилясте
 	Home / End	Home / End
 	H / Space (hold)	H / Пробіл (утримувати)
+	Rotation:	Поворот:
+	Line ending	Закінчення лінії
+	The standard fonts can't draw “{c}” ({code}). Only Western European characters can be added as text for now.	Стандартні шрифти не можуть відобразити «{c}» ({code}). Поки що як текст можна додавати лише західноєвропейські символи.
